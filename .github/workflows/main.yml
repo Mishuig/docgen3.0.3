@@ -1,0 +1,99 @@
+name: Build portable Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Locate project file
+        id: project
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "=== Workspace: $env:GITHUB_WORKSPACE ==="
+          Get-ChildItem $env:GITHUB_WORKSPACE | ForEach-Object { $_.Name }
+
+          $found = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter 'DocumentGenerator.csproj' -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $found) {
+            $found = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter '*.csproj' -ErrorAction SilentlyContinue |
+                     Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          if (-not $found) {
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File | ForEach-Object { $_.FullName }
+            throw 'No .csproj found. Upload source files to the repository.'
+          }
+
+          Write-Host "Using project: $found"
+          $projDir = Split-Path $found -Parent
+          "path=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "dir=$projDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore "${{ steps.project.outputs.path }}" --runtime win-x64
+
+      - name: Publish portable win-x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:GITHUB_WORKSPACE 'publish\DocumentGenerator-portable-win-x64'
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+
+          $proj = "${{ steps.project.outputs.path }}"
+          $projDir = "${{ steps.project.outputs.dir }}"
+
+          dotnet publish $proj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --no-restore `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            --output $package
+
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+          if (-not (Test-Path (Join-Path $package 'DocumentGenerator.exe'))) {
+            throw 'DocumentGenerator.exe was not produced.'
+          }
+
+          $readme = Join-Path $projDir 'README.md'
+          if (Test-Path $readme) { Copy-Item $readme (Join-Path $package 'README.txt') }
+
+          $samples = Join-Path $projDir 'samples'
+          if (Test-Path $samples) { Copy-Item $samples (Join-Path $package 'samples') -Recurse -Force }
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'publish\DocumentGenerator-0.3.1-portable-win-x64.zip'
+          Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -Force
+          Write-Host "Created: $zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocumentGenerator-0.3.1-portable-win-x64
+          path: publish/DocumentGenerator-0.3.1-portable-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
