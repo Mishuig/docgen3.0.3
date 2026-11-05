@@ -1,0 +1,115 @@
+name: Build portable Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '**.cs'
+      - '**.xaml'
+      - '**.csproj'
+      - 'samples/**'
+      - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Locate project file
+        id: project
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "=== Workspace root: $env:GITHUB_WORKSPACE ==="
+          Get-ChildItem $env:GITHUB_WORKSPACE | ForEach-Object { Write-Host $_.Name }
+
+          # Search recursively for DocumentGenerator.csproj (or any .csproj)
+          $found = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter 'DocumentGenerator.csproj' -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $found) {
+            $found = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter '*.csproj' -ErrorAction SilentlyContinue |
+                     Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          if (-not $found) {
+            Write-Host '=== All files in workspace ==='
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+            throw 'No .csproj found anywhere in the repository. Check that source files were uploaded.'
+          }
+
+          Write-Host "Using project: $found"
+          $projDir = Split-Path $found -Parent
+          "path=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "dir=$projDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Restore dependencies
+        shell: pwsh
+        run: |
+          $proj = "${{ steps.project.outputs.path }}"
+          Write-Host "Restoring: $proj"
+          dotnet restore $proj --runtime win-x64
+          if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed for $proj" }
+
+      - name: Publish self-contained Windows x64 app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:GITHUB_WORKSPACE 'publish\DocumentGenerator-portable-win-x64'
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+
+          $proj = "${{ steps.project.outputs.path }}"
+          $projDir = "${{ steps.project.outputs.dir }}"
+          Write-Host "Publishing: $proj"
+          Write-Host "Project dir: $projDir"
+
+          dotnet publish $proj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --no-restore `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            --output $package
+
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+
+          $exe = Join-Path $package 'DocumentGenerator.exe'
+          if (-not (Test-Path $exe)) { throw 'DocumentGenerator.exe was not produced.' }
+
+          $readme = Join-Path $projDir 'README.md'
+          if (Test-Path $readme) {
+            Copy-Item $readme (Join-Path $package 'README.txt')
+          }
+          $samples = Join-Path $projDir 'samples'
+          if (Test-Path $samples) {
+            Copy-Item $samples (Join-Path $package 'samples') -Recurse -Force
+          }
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'publish\DocumentGenerator-0.3.1-portable-win-x64.zip'
+          Compress-Archive -Path (Join-Path $package '*') -DestinationPath $zip -Force
+          Write-Host "Portable package created: $zip"
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocumentGenerator-0.3.1-portable-win-x64
+          path: publish/DocumentGenerator-0.3.1-portable-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
